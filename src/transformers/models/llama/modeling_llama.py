@@ -174,6 +174,84 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
+MLP_counter = 0
+
+def reset_MLP_counter():
+    global MLP_counter
+    MLP_counter = 0
+
+def draw_heatmap(weight: torch.Tensor, name:str):
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    matrix = weight[-400:, :1400]  # Last 400 rows, first 1400 columns
+    matrix = (matrix - matrix.min()) / (matrix.max() - matrix.min())
+
+    plt.figure(figsize=(12, 6))  # Adjust figure size
+    plt.imshow(matrix.cpu(), aspect="auto", cmap="viridis", interpolation="nearest")
+
+    # Add colorbar
+    plt.colorbar(label="Value Intensity")
+
+    # Titles and labels
+    global MLP_counter
+    plt.title(f"{name} Weight in Layer {MLP_counter} Heatmap", fontsize=14)
+    plt.xlabel("Columns", fontsize=12)
+    plt.ylabel("Rows", fontsize=12)
+
+    plt.savefig(f"./heatmaps/{name}_layer{MLP_counter}_heatmap.png", bbox_inches="tight")
+
+def tile_wise_svd(weight: torch.Tensor, name: str, topk=1.0):
+    weight_fp32 = weight.to(torch.float32) # Convert to float32
+    # down proj weight size = 4k * 14k; tile size = 128 * 128; tiles=32 * 112=3584
+    # gate&up proj weight size = 14k * 4k; tile size = 128 * 128; tiles=112 * 32=3584
+    tile_h, tile_w = 128, 128
+    rows, cols = weight_fp32.shape        
+    # Calculate number of tiles in each dimension
+    num_tiles_h = (rows + tile_h - 1) // tile_h  
+    num_tiles_w = (cols + tile_w - 1) // tile_w
+    global MLP_counter
+    if MLP_counter == 1:
+        print(f"{name} matrix size: {rows} x {cols}", 
+              f"Tile size: {tile_h} x {tile_w}", 
+              f"Number of tiles: {num_tiles_h} x {num_tiles_w} = {num_tiles_h * num_tiles_w} total tiles")
+    # Create a list to store all singular values
+    all_singular_values = []
+    # Process each tile
+    for i in range(num_tiles_h):
+        for j in range(num_tiles_w):
+            # Get tile boundaries
+            row_start = i * tile_h
+            row_end = min((i + 1) * tile_h, rows)
+            col_start = j * tile_w  
+            col_end = min((j + 1) * tile_w, cols)
+            # Extract tile
+            tile = weight_fp32[row_start:row_end, col_start:col_end]
+            # Perform SVD on tile
+            U_tile, S_tile, V_tile = torch.svd(tile)
+            # Set values below top k% to zero
+            k_values = int(topk * S_tile.shape[0])
+            S_tile[k_values:] = 0
+            # Store singular values
+            all_singular_values.append(S_tile)
+            # Reconstruct tile
+            reconstructed_tile = torch.matmul(U_tile, torch.matmul(torch.diag(S_tile), V_tile.T))
+            # Put reconstructed tile back
+            weight_fp32[row_start:row_end, col_start:col_end] = reconstructed_tile
+    
+    # Concatenate all singular values and save to file
+    all_singular_values = torch.cat(all_singular_values)
+    # Create directory if it doesn't exist
+    import os
+    os.makedirs(f'./data/{name}', exist_ok=True)
+    torch.save(all_singular_values, f'./data/{name}/singular_values_mlp_{name}_{MLP_counter}.pt')
+    
+    # Convert back to original dtype and update weights
+    reconstructed_weight = weight_fp32.to(weight.dtype)
+    # Calculate error for the whole matrix
+    total_error = torch.norm(weight - reconstructed_weight, p=2)
+    print(f"SVD error with topk={topk} for the {name} matrix: {total_error}")
+    return reconstructed_weight
 
 class LlamaMLP(nn.Module):
     def __init__(self, config):
@@ -185,9 +263,45 @@ class LlamaMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
+        # Store the topk value from config
+        self.topk_svd = getattr(config, "topk_svd", 1.0)
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        mode = 0 # 0 for original execution; 1 for svd; 2 for tile-wise svd
+        global MLP_counter
+        MLP_counter += 1
+        # 0) original execution
+        if mode == 0:
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            # draw_heatmap(self.gate_proj.weight, "gate_proj")
+            # draw_heatmap(self.up_proj.weight, "up_proj")
+            # draw_heatmap(self.down_proj.weight, "down_proj")
+        # 1) SVD for down_proj weights
+        elif mode == 1:
+            gated_proj = self.act_fn(self.gate_proj(x))
+            up_proj = self.up_proj(x)
+            weight_fp32 = self.down_proj.weight.to(torch.float32) # Convert to float32
+            U, S, V = torch.svd(weight_fp32)
+            # print("U size:", U.shape, "S size:", S.shape, "V size:", V.shape)
+            print("MLP index:", MLP_counter)
+            reconstructed_weight = torch.matmul(U, torch.matmul(torch.diag(S), V.T)).to(self.down_proj.weight.dtype) # Convert back to original dtype before using
+            self.down_proj.weight.data.copy_(reconstructed_weight)
+            down_proj = self.down_proj(gated_proj * up_proj)
+        # 2) tile-wise SVD for down_proj weights
+        elif mode == 2:
+            if MLP_counter <= 32:
+                reconstructed_gate_proj_weight = tile_wise_svd(self.gate_proj.weight, "gate_proj_weight", topk=self.topk_svd)
+                self.gate_proj.weight.data.copy_(reconstructed_gate_proj_weight)
+                reconstructed_up_proj_weight = tile_wise_svd(self.up_proj.weight, "up_proj_weight", topk=self.topk_svd)
+                self.up_proj.weight.data.copy_(reconstructed_up_proj_weight)
+                reconstructed_down_proj_weight = tile_wise_svd(self.down_proj.weight, "down_proj_weight", topk=self.topk_svd)
+                self.down_proj.weight.data.copy_(reconstructed_down_proj_weight)
+                print("MLP index:", MLP_counter)
+                import sys
+                sys.stdout.flush()
+            gated_proj = self.act_fn(self.gate_proj(x))
+            up_proj = self.up_proj(x)
+            down_proj = self.down_proj(gated_proj * up_proj)
         return down_proj
 
 
